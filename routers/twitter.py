@@ -7,7 +7,7 @@ import time
 import os
 import re
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -16,28 +16,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from ddgs import DDGS
-from helpers.mongo_helper import get_sessions_collection, mongo, upsert_session, get_session, upsert_twitter_profile, get_twitter_collection
+from helpers.mongo_helper import get_sessions_collection, get_session, upsert_twitter_profile
 from bs4 import BeautifulSoup
 
 router = APIRouter(prefix="/twitter", tags=["twitter"])
-
-
-class CookieUploadRequest(BaseModel):
-    cookies: List[Dict[str, Any]]
-
-
-@router.post('/upload_cookies')
-def upload_twitter_cookies(req: CookieUploadRequest):
-    """Upload a list of cookies (list of dicts) to the sessions collection as type 'twitter_cookies'.
-    Payload example: { "cookies": [ {"name":"...","value":"...","domain":"..."}, ... ] }
-    """
-    try:
-        # Use helper to upsert session document
-        sessions = get_sessions_collection()
-        upsert_session({"type": "twitter_cookies"}, {"type": "twitter_cookies", "cookies": req.cookies, "updated_at": int(time.time())})
-        return {"status": "ok", "message": f"Saved {len(req.cookies)} cookies to sessions collection"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save cookies: {e}")
 
 # Request/Response models
 class TwitterScrapeRequest(BaseModel):
@@ -60,17 +42,19 @@ class TwitterCommentScraper:
     def setup_driver(self):
         """Initialize Chrome driver with session cookies from MongoDB"""
         options = Options()
-        # Run headless by default (can be disabled with TWITTER_HEADLESS=false)
-        headless_flag = os.getenv("TWITTER_HEADLESS", "true").lower()
-        if headless_flag in ("1", "true", "yes"):
-            # Modern Chrome uses --headless=new; fallback to --headless if needed
-            options.add_argument("--headless=new")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--window-size=1920,1080")
-        else:
-            options.add_argument("--start-maximized")
+        # Headless startup commented out so the browser window is visible for debugging.
+        # To re-enable headless mode, restore the TWITTER_HEADLESS logic below.
+        # headless_flag = os.getenv("TWITTER_HEADLESS", "true").lower()
+        # if headless_flag in ("1", "true", "yes"):
+        #     # Modern Chrome uses --headless=new; fallback to --headless if needed
+        #     options.add_argument("--headless=new")
+        #     options.add_argument("--disable-gpu")
+        #     options.add_argument("--no-sandbox")
+        #     options.add_argument("--disable-dev-shm-usage")
+        #     options.add_argument("--window-size=1920,1080")
+        # else:
+        options.add_argument("--start-maximized")
+        print("⚠️ Running Chrome with UI (non-headless) for debugging; set TWITTER_HEADLESS to enable headless mode")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
@@ -510,7 +494,7 @@ class TwitterCommentScraper:
         
         try:
             self.driver.get(tweet_url)
-            time.sleep(10)  # Longer initial wait
+            time.sleep(12)  # Longer initial wait to let replies render
             
             # Get the original tweet content
             original_tweet_content = ""
@@ -546,11 +530,10 @@ class TwitterCommentScraper:
                     "//article[@data-testid='tweet']",
                 ]
             else:
+                # Narrow selectors to tweet articles' tweetText to avoid sidebar/profile tokens
                 comment_selectors = [
-                    "//div[@data-testid='tweetText']",
-                    "//article[@data-testid='tweet']//span",
-                    "//div[@data-testid='cellInnerDiv']//span",
-                    "//div[contains(@class,'css-1dbjc4n')]//span[contains(text(),'@') or string-length(text()) > 10]",
+                    "//article[@data-testid='tweet']//div[@data-testid='tweetText']",
+                    "//div[@role='region']//article[@data-testid='tweet']//div[@data-testid='tweetText']",
                 ]
 
             expand_patterns = [
@@ -566,8 +549,8 @@ class TwitterCommentScraper:
                 "//div[@aria-label and contains(@aria-label,'replies')]",
             ]
 
-            max_rounds = 200
-            no_progress_limit = 30
+            max_rounds = 300
+            no_progress_limit = 60
             round_idx = 0
             last_count = len(all_comments)
             no_progress = 0
@@ -580,8 +563,21 @@ class TwitterCommentScraper:
                         buttons = self.driver.find_elements(By.XPATH, pattern)
                         for btn in buttons[:8]:
                             try:
+                                # Avoid clicking anchors that would navigate away (href present)
+                                # Avoid clicking if this element (or its ancestor) is an anchor with a real href
+                                try:
+                                    closest_href = self.driver.execute_script(
+                                        "return (function(el){var a=el.closest('a'); return a? a.getAttribute('href') : null;})(arguments[0]);",
+                                        btn
+                                    )
+                                except Exception:
+                                    closest_href = None
+
                                 self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                                 time.sleep(0.4)
+                                if closest_href and isinstance(closest_href, str) and closest_href.strip() and not closest_href.strip().startswith('javascript'):
+                                    # skip anchors that would navigate away
+                                    continue
                                 btn.click()
                                 clicked += 1
                                 time.sleep(0.6)
@@ -592,11 +588,20 @@ class TwitterCommentScraper:
 
                 # Additionally, try clicking buttons that match the regex 'Read <number> replies'
                 try:
-                    read_buttons = self.driver.find_elements(By.XPATH, "//div[contains(.,'Read') and contains(.,'replies') or //span[contains(.,'Read') and contains(.,'replies')]")
+                    read_buttons = self.driver.find_elements(By.XPATH, "//div[contains(.,'Read') and contains(.,'replies')] | //span[contains(.,'Read') and contains(.,'replies')] | //a[contains(.,'replies') and contains(.,'Read')]")
                     for rb in read_buttons[:6]:
                         try:
+                            try:
+                                closest_href = self.driver.execute_script(
+                                    "return (function(el){var a=el.closest('a'); return a? a.getAttribute('href') : null;})(arguments[0]);",
+                                    rb
+                                )
+                            except Exception:
+                                closest_href = None
                             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", rb)
                             time.sleep(0.3)
+                            if closest_href and isinstance(closest_href, str) and closest_href.strip() and not closest_href.strip().startswith('javascript'):
+                                continue
                             rb.click()
                             clicked += 1
                             time.sleep(0.6)
@@ -664,20 +669,26 @@ class TwitterCommentScraper:
             # Try to extract from page source
             try:
                 page_source = self.driver.page_source
-                # Look for tweet text patterns in raw HTML
-                import re
-                tweet_patterns = [
-                    r'data-testid="tweetText"[^>]*>([^<]+)',
-                    r'<span[^>]*>([^<@#]{10,200})</span>',
-                ]
-                
-                for pattern in tweet_patterns:
-                    matches = re.findall(pattern, page_source)
-                    for match in matches:
-                        clean_text = re.sub(r'<[^>]+>', '', match).strip()
-                        if (clean_text and len(clean_text) > 5 and 
-                            clean_text != original_tweet_content):
-                            all_comments.add(clean_text)
+                # Use BeautifulSoup to extract tweet text inside article nodes
+                try:
+                    soup = BeautifulSoup(page_source, 'html.parser')
+                    articles = soup.find_all('article', attrs={'data-testid': 'tweet'})
+                    for art in articles:
+                        # look for tweetText divs inside article
+                        tt = art.find(attrs={'data-testid': 'tweetText'})
+                        if tt:
+                            clean_text = tt.get_text(separator=' ').strip()
+                            if clean_text and len(clean_text) > 3 and clean_text != original_tweet_content:
+                                all_comments.add(clean_text)
+                        else:
+                            # fallback: collect significant span/textnodes under article
+                            text_nodes = art.find_all('span')
+                            for sp in text_nodes:
+                                st = sp.get_text().strip()
+                                if st and len(st) > 8 and st != original_tweet_content:
+                                    all_comments.add(st)
+                except Exception:
+                    pass
             except:
                 pass
             
@@ -695,9 +706,9 @@ class TwitterCommentScraper:
                 
                 # Final collection with all possible selectors
                 final_selectors = [
-                    "//div[@data-testid='tweetText']",
-                    "//span[contains(@class,'css-') and string-length(text()) > 8]",
-                    "//*[contains(text(),'@') and string-length(text()) > 10]",
+                    # Target tweetText inside article elements only
+                    "//article[@data-testid='tweet']//div[@data-testid='tweetText']",
+                    "//div[@role='region']//article[@data-testid='tweet']//div[@data-testid='tweetText']",
                 ]
                 
                 for selector in final_selectors:
@@ -730,6 +741,9 @@ class TwitterCommentScraper:
                 low = t.lower()
                 # ignore purely numeric counts or very short labels
                 if re.fullmatch(r"[0-9,\.\s]+(views)?", low):
+                    return True
+                # ignore profile sidebar tokens like '82.7K posts' or '18.4K posts'
+                if re.search(r"\bposts\b", low) or re.search(r"\bfollowers?\b", low) or re.search(r"\bfollowing\b", low):
                     return True
                 for bad in ui_blacklist:
                     if bad.lower() in low:
