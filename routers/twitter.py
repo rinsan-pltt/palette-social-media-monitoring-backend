@@ -16,7 +16,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from ddgs import DDGS
-from helpers.mongo_helper import get_sessions_collection, get_session, upsert_twitter_profile
+from helpers.mongo_helper import get_sessions_collection, get_session, upsert_twitter_profile, upsert_session
 from bs4 import BeautifulSoup
 
 router = APIRouter(prefix="/twitter", tags=["twitter"])
@@ -42,19 +42,25 @@ class TwitterCommentScraper:
     def setup_driver(self):
         """Initialize Chrome driver with session cookies from MongoDB"""
         options = Options()
-        # Headless startup commented out so the browser window is visible for debugging.
-        # To re-enable headless mode, restore the TWITTER_HEADLESS logic below.
-        # headless_flag = os.getenv("TWITTER_HEADLESS", "true").lower()
-        # if headless_flag in ("1", "true", "yes"):
-        #     # Modern Chrome uses --headless=new; fallback to --headless if needed
-        #     options.add_argument("--headless=new")
-        #     options.add_argument("--disable-gpu")
-        #     options.add_argument("--no-sandbox")
-        #     options.add_argument("--disable-dev-shm-usage")
-        #     options.add_argument("--window-size=1920,1080")
-        # else:
-        options.add_argument("--start-maximized")
-        print("⚠️ Running Chrome with UI (non-headless) for debugging; set TWITTER_HEADLESS to enable headless mode")
+        # Headless controlled via env var; default to non-headless for reliability
+        headless_flag = os.getenv("TWITTER_HEADLESS", "false").lower()
+        is_headless = headless_flag in ("1", "true", "yes")
+        self.is_headless = is_headless
+        if is_headless:
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--window-size=1920,1080")
+            # Provide a desktop user-agent to avoid mobile/reduced views
+            ua = os.getenv('TW_USER_AGENT') or 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            options.add_argument(f"--user-agent={ua}")
+            print("⚠️ Running Chrome in headless mode; using desktop user-agent and larger window-size")
+        else:
+            options.add_argument("--start-maximized")
+            options.add_argument("--window-size=1920,1080")
+            print("⚠️ Running Chrome with UI (non-headless); set TWITTER_HEADLESS=1 to run headless")
+       
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
@@ -71,10 +77,45 @@ class TwitterCommentScraper:
         # Load Twitter/X homepage first
         print("🌐 Loading Twitter/X...")
         self.driver.get("https://x.com/")
-        time.sleep(3)
+        # give extra time when headless so client-side rendering finishes
+        if getattr(self, 'is_headless', False):
+            time.sleep(6)
+        else:
+            time.sleep(3)
         
         # Load cookies from MongoDB
-        cookies_loaded = self.load_cookies_from_mongo()
+        # Optional: allow loading cookies from a local file for debugging (TW_COOKIES_FILE)
+        local_cookie_file = os.getenv('TW_COOKIES_FILE')
+        cookies_loaded = False
+        if local_cookie_file and os.path.exists(local_cookie_file):
+            try:
+                print(f"🔁 Loading cookies from local file: {local_cookie_file}")
+                with open(local_cookie_file, 'r', encoding='utf-8') as cf:
+                    file_cookies = json.load(cf)
+                # Reuse the same acceptance logic as load_cookies_from_mongo
+                current_domain = "x.com"
+                from selenium.common.exceptions import InvalidCookieDomainException
+                loaded = 0
+                for cookie in file_cookies:
+                    cookie_to_add = cookie.copy()
+                    if 'domain' in cookie_to_add and current_domain not in str(cookie_to_add.get('domain', '')):
+                        cookie_to_add.pop('domain', None)
+                    try:
+                        self.driver.add_cookie(cookie_to_add)
+                        loaded += 1
+                    except InvalidCookieDomainException:
+                        print(f"   ⚠️ Skipping cookie due to domain mismatch: {cookie.get('name')}")
+                    except Exception as e:
+                        print(f"   Skipping invalid cookie: {e}")
+                print(f"   ✅ Local cookies accepted: {loaded}/{len(file_cookies)}")
+                self.driver.refresh()
+                time.sleep(4)
+                cookies_loaded = True
+            except Exception as e:
+                print(f"⚠️ Failed to load local cookie file: {e}")
+
+        if not cookies_loaded:
+            cookies_loaded = self.load_cookies_from_mongo()
         if not cookies_loaded:
             print("\n❌ Cannot proceed without valid authentication cookies.")
             if self.driver:
@@ -82,6 +123,85 @@ class TwitterCommentScraper:
             return False
         
         return True
+
+    def safe_scroll_into_view(self, element):
+        """Scroll element into view only if it's below the current viewport to avoid jumping up."""
+        try:
+            rect_top = self.driver.execute_script("return arguments[0].getBoundingClientRect().top;", element)
+            viewport_height = self.driver.execute_script("return window.innerHeight || document.documentElement.clientHeight;")
+            # If element is already visible or above, avoid scrolling up; only scroll when it's below viewport
+            if rect_top > viewport_height - 40:
+                try:
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+                    time.sleep(0.25)
+                except Exception:
+                    pass
+        except Exception:
+            # fallback to default scrollIntoView
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+                time.sleep(0.25)
+            except Exception:
+                pass
+
+    def safe_click(self, element):
+        """Click an element only if it is unlikely to be a 'Like' button or a navigation anchor.
+        Returns True if clicked, False if skipped.
+        """
+        try:
+            # Avoid clicking anchors that would navigate away, unless caller explicitly allows anchors
+            try:
+                closest_href = self.driver.execute_script(
+                    "return (function(el){var a=el.closest('a'); return a? a.getAttribute('href') : null;})(arguments[0]);",
+                    element
+                )
+            except Exception:
+                closest_href = None
+
+            # allow_anchor will be passed by caller when clicking expansion 'Read/Show' anchors
+            allow_anchor = getattr(element, '_allow_anchor_click', False)
+            if closest_href and isinstance(closest_href, str) and closest_href.strip() and not allow_anchor:
+                # if href looks like a full tweet link, avoid clicking
+                if not closest_href.strip().startswith('javascript') and not closest_href.strip().startswith('#'):
+                    return False
+
+            # Avoid clicking elements that are probably Like buttons: look for closest ancestor with data-testid containing 'like' or aria-label containing 'Like'
+            try:
+                like_ancestor = self.driver.execute_script(
+                    "return (function(el){var p=el.closest('[data-testid]'); while(p){ if(p.getAttribute('data-testid') && p.getAttribute('data-testid').toLowerCase().includes('like')) return p; p=p.parentElement;} return null;})(arguments[0]);",
+                    element
+                )
+            except Exception:
+                like_ancestor = None
+
+            if like_ancestor:
+                return False
+
+            # Also check aria-labels for 'Like' nearby
+            try:
+                aria_like = self.driver.execute_script(
+                    "return (function(el){var a=el.closest('[aria-label]'); return a? a.getAttribute('aria-label') : null;})(arguments[0]);",
+                    element
+                )
+            except Exception:
+                aria_like = None
+            if aria_like and 'like' in aria_like.lower():
+                return False
+
+            # Finally, attempt to click
+            try:
+                element.click()
+                time.sleep(0.45)
+                return True
+            except Exception:
+                try:
+                    self.driver.execute_script("arguments[0].click();", element)
+                    time.sleep(0.45)
+                    return True
+                except Exception:
+                    return False
+        except Exception:
+            return False
     
     def load_cookies_from_mongo(self):
         """Load cookies from MongoDB sessions collection"""
@@ -99,12 +219,25 @@ class TwitterCommentScraper:
                 return False
                 
             print(f"✅ Loading {len(cookies)} cookies from MongoDB")
+            # Ensure we're on x.com so Selenium accepts cookies; Selenium requires the current
+            # domain to match the cookie domain. We'll remove cookie 'domain' entries that
+            # don't match the current page domain to increase acceptance.
+            current_domain = "x.com"
+            from selenium.common.exceptions import InvalidCookieDomainException
+            loaded = 0
             for cookie in cookies:
+                cookie_to_add = cookie.copy()
+                if 'domain' in cookie_to_add and current_domain not in str(cookie_to_add.get('domain', '')):
+                    cookie_to_add.pop('domain', None)
                 try:
-                    self.driver.add_cookie(cookie)
+                    self.driver.add_cookie(cookie_to_add)
+                    loaded += 1
+                except InvalidCookieDomainException:
+                    print(f"   ⚠️ Skipping cookie due to domain mismatch: {cookie.get('name')}")
                 except Exception as e:
                     print(f"   Skipping invalid cookie: {e}")
                     pass
+            print(f"   ✅ Cookies accepted: {loaded}/{len(cookies)}")
             print("✅ Session cookies loaded successfully from MongoDB.")
             self.driver.refresh()
             time.sleep(5)
@@ -121,24 +254,38 @@ class TwitterCommentScraper:
         are present on a profile page, we treat it as logged out.
         """
         try:
-            # If tweet/article elements are present anywhere, likely logged in
-            articles = self.driver.find_elements(By.XPATH, "//article[@data-testid='tweet']")
-            if articles and len(articles) > 0:
-                return True
-
-            # Check for common login prompt indicators (buttons/links with 'Log in' text)
+            # 1) Logged-in UX usually contains a reply textarea or explicit 'Post your reply' text.
             try:
-                login_buttons = self.driver.find_elements(By.XPATH, "//a[contains(., 'Log in') or contains(., 'Log in to')] | //div[contains(., 'Log in')]")
+                reply_box = self.driver.find_elements(By.XPATH, "//div[contains(., 'Post your reply')] | //div[@role='textbox'] | //textarea[contains(@placeholder, 'Reply') or contains(@placeholder, 'Tweet')]")
+                if reply_box and len(reply_box) > 0:
+                    return True
+            except Exception:
+                pass
+
+            # 2) Presence of article tweet nodes AND profile/header elements is a good indicator
+            try:
+                articles = self.driver.find_elements(By.XPATH, "//article[@data-testid='tweet']")
+                headers = self.driver.find_elements(By.XPATH, "//div[contains(@data-testid,'primaryColumn')]//h2 | //div[contains(@data-testid,'UserName')]")
+                if articles and headers and len(articles) > 0 and len(headers) > 0:
+                    return True
+            except Exception:
+                pass
+
+            # 3) Detect explicit login prompts (Log in / Sign in) — if present and no reply box, likely logged out
+            try:
+                login_buttons = self.driver.find_elements(By.XPATH, "//a[contains(., 'Log in') or contains(., 'Log in to') or contains(., 'Sign in')] | //div[contains(., 'Log in') or contains(., 'Sign in')]")
                 if login_buttons and len(login_buttons) > 0:
                     return False
             except Exception:
                 pass
 
-            # As a last resort, check for profile header elements that indicate public profile view
-            headers = self.driver.find_elements(By.XPATH, "//div[contains(@data-testid,'primaryColumn')]//h2 | //div[contains(@data-testid,'UserName')]")
-            if headers and len(headers) > 0:
-                # presence of header doesn't guarantee logged-in, but helpful
-                return True
+            # 4) If we see 'Read <n> replies' prompts but no reply box, that's another sign of logged-out restricted view
+            try:
+                read_prompts = self.driver.find_elements(By.XPATH, "//div[contains(., 'Read') and contains(., 'replies')] | //span[contains(., 'Read') and contains(., 'replies')]")
+                if read_prompts and len(read_prompts) > 0:
+                    return False
+            except Exception:
+                pass
 
         except Exception:
             return False
@@ -169,22 +316,141 @@ class TwitterCommentScraper:
         # Try reloading cookies from MongoDB (in case driver lost them)
         print("🔁 Session appears logged out — reloading cookies from DB and refreshing...")
         loaded = self.load_cookies_from_mongo()
-        if not loaded:
-            print("❌ No cookies available in DB to restore session")
+        if loaded:
+            try:
+                self.driver.refresh()
+                time.sleep(5)
+            except Exception:
+                pass
+
+            if self.is_logged_in():
+                print("✅ Session restored from DB cookies")
+                return True
+
+        # If cookie restore didn't work, attempt credential login using env credentials
+        print("🔐 Cookie restore failed — attempting credential login using TW_USER/TW_PASSWORD from environment...")
+        tw_user = os.getenv('TW_USER')
+        tw_pass = os.getenv('TW_PASSWORD')
+        if not tw_user or not tw_pass:
+            print("❌ No TW_USER/TW_PASSWORD available in environment to attempt login")
             return False
 
         try:
-            self.driver.refresh()
+            logged_in = self.login_with_credentials(tw_user, tw_pass)
+            if logged_in:
+                # save cookies back to Mongo
+                try:
+                    cookies = self.driver.get_cookies()
+                    upsert_session({"type": "twitter_cookies"}, {"type": "twitter_cookies", "cookies": cookies, "updated_at": int(time.time())})
+                    print(f"💾 Saved {len(cookies)} cookies to sessions collection")
+                except Exception as e:
+                    print(f"⚠️ Could not save cookies to MongoDB: {e}")
+
+                return True
+            else:
+                print("⚠️ Credential login attempt failed or session still logged out")
+                return False
+        except Exception as e:
+            print(f"⚠️ Exception during credential login attempt: {e}")
+            return False
+
+    def login_with_credentials(self, username: str, password: str) -> bool:
+        """Attempt to log in to X/Twitter using provided credentials via Selenium.
+        Returns True if login appears successful.
+        """
+        try:
+            uname = username.strip()
+            if uname.startswith('@'):
+                uname = uname[1:]
+
+            # navigate to login
+            try:
+                self.driver.get('https://x.com/login')
+            except Exception:
+                try:
+                    self.driver.get('https://twitter.com/login')
+                except Exception:
+                    pass
+            time.sleep(3)
+
+            # Try several username input selectors
+            username_selectors = [
+                (By.NAME, 'text'),
+                (By.XPATH, "//input[@name='session[username_or_email]']"),
+                (By.XPATH, "//input[@autocomplete='username']"),
+            ]
+            username_elem = None
+            for by, sel in username_selectors:
+                try:
+                    username_elem = self.driver.find_element(by, sel)
+                    break
+                except Exception:
+                    username_elem = None
+
+            if username_elem:
+                try:
+                    username_elem.clear()
+                    username_elem.send_keys(uname)
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+
+            # Click Next / Continue if present
+            try:
+                for txt in ['Next', 'Log in', 'Continue', 'Sign in']:
+                    try:
+                        btn = self.driver.find_element(By.XPATH, f"//div[@role='button' and contains(., '{txt}')] | //span[contains(., '{txt}')]//ancestor::div[@role='button']")
+                        if btn:
+                            btn.click()
+                            time.sleep(1.2)
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Find password input
+            pw_elem = None
+            try:
+                pw_elem = self.driver.find_element(By.XPATH, "//input[@type='password']")
+            except Exception:
+                try:
+                    pw_elem = self.driver.find_element(By.NAME, 'password')
+                except Exception:
+                    pw_elem = None
+
+            if not pw_elem:
+                print('⚠️ Password field not found automatically during login')
+                return False
+
+            try:
+                pw_elem.clear()
+                pw_elem.send_keys(password)
+                time.sleep(0.6)
+            except Exception:
+                pass
+
+            try:
+                pw_elem.submit()
+            except Exception:
+                try:
+                    for txt in ['Log in', 'Log in to X', 'Sign in', 'Continue']:
+                        try:
+                            btn = self.driver.find_element(By.XPATH, f"//div[@role='button' and contains(., '{txt}')] | //span[contains(., '{txt}')]//ancestor::div[@role='button']")
+                            btn.click()
+                            break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
             time.sleep(5)
+            # check login state
+            if self.is_logged_in():
+                return True
+            return False
         except Exception:
-            pass
-
-        if self.is_logged_in():
-            print("✅ Session restored from DB cookies")
-            return True
-
-        print("⚠️ Session still appears logged out after loading cookies")
-        return False
+            return False
     
     def search_twitter_users(self, brand_name, max_results=5):
         """Search for Twitter users/profiles using DuckDuckGo"""
@@ -490,11 +756,14 @@ class TwitterCommentScraper:
         if not self.ensure_logged_in(tweet_url):
             print("❌ Cannot scrape comments because session is not authenticated")
             return []
-        all_comments = set()
+        # Use a map of unique_id -> text to deduplicate reliably across DOM changes
+        all_comments = {}
         
         try:
             self.driver.get(tweet_url)
-            time.sleep(12)  # Longer initial wait to let replies render
+            # Longer initial wait to let replies render; give extra time when headless
+            initial_wait = 18 if getattr(self, 'is_headless', False) else 12
+            time.sleep(initial_wait)
             
             # Get the original tweet content
             original_tweet_content = ""
@@ -549,8 +818,8 @@ class TwitterCommentScraper:
                 "//div[@aria-label and contains(@aria-label,'replies')]",
             ]
 
-            max_rounds = 300
-            no_progress_limit = 60
+            max_rounds = 80
+            no_progress_limit = 12
             round_idx = 0
             last_count = len(all_comments)
             no_progress = 0
@@ -563,24 +832,24 @@ class TwitterCommentScraper:
                         buttons = self.driver.find_elements(By.XPATH, pattern)
                         for btn in buttons[:8]:
                             try:
-                                # Avoid clicking anchors that would navigate away (href present)
-                                # Avoid clicking if this element (or its ancestor) is an anchor with a real href
+                                # Use safer scrolling and clicking helpers to avoid jumping and accidental likes
                                 try:
-                                    closest_href = self.driver.execute_script(
-                                        "return (function(el){var a=el.closest('a'); return a? a.getAttribute('href') : null;})(arguments[0]);",
-                                        btn
-                                    )
+                                    self.safe_scroll_into_view(btn)
                                 except Exception:
-                                    closest_href = None
-
-                                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                                time.sleep(0.4)
-                                if closest_href and isinstance(closest_href, str) and closest_href.strip() and not closest_href.strip().startswith('javascript'):
-                                    # skip anchors that would navigate away
-                                    continue
-                                btn.click()
-                                clicked += 1
-                                time.sleep(0.6)
+                                    pass
+                                # allow anchors for expansion-like buttons
+                                try:
+                                    txt = btn.text or ''
+                                except Exception:
+                                    txt = ''
+                                if any(k in txt for k in ['Read', 'Show', 'replies', 'Show more', 'Show this thread']):
+                                    try:
+                                        setattr(btn, '_allow_anchor_click', True)
+                                    except Exception:
+                                        pass
+                                clicked_flag = self.safe_click(btn)
+                                if clicked_flag:
+                                    clicked += 1
                             except Exception:
                                 pass
                     except Exception:
@@ -592,19 +861,21 @@ class TwitterCommentScraper:
                     for rb in read_buttons[:6]:
                         try:
                             try:
-                                closest_href = self.driver.execute_script(
-                                    "return (function(el){var a=el.closest('a'); return a? a.getAttribute('href') : null;})(arguments[0]);",
-                                    rb
-                                )
+                                self.safe_scroll_into_view(rb)
                             except Exception:
-                                closest_href = None
-                            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", rb)
-                            time.sleep(0.3)
-                            if closest_href and isinstance(closest_href, str) and closest_href.strip() and not closest_href.strip().startswith('javascript'):
-                                continue
-                            rb.click()
-                            clicked += 1
-                            time.sleep(0.6)
+                                pass
+                            try:
+                                txt = rb.text or ''
+                            except Exception:
+                                txt = ''
+                            if any(k in txt for k in ['Read', 'Show', 'replies']):
+                                try:
+                                    setattr(rb, '_allow_anchor_click', True)
+                                except Exception:
+                                    pass
+                            clicked_flag = self.safe_click(rb)
+                            if clicked_flag:
+                                clicked += 1
                         except Exception:
                             pass
                 except Exception:
@@ -636,11 +907,32 @@ class TwitterCommentScraper:
                                 else:
                                     text = elem.text.strip()
 
-                                if (text and len(text) > 3 and 
+                                if (text and len(text) > 3 and
                                     text != original_tweet_content and
                                     not text.startswith('Replying to') and
                                     not text.startswith('Show this thread')):
-                                    all_comments.add(text)
+                                    # Try to find a stable identifier for this reply: time element's parent href
+                                    uid = None
+                                    try:
+                                        art = elem if elem.tag_name.lower() == 'article' else elem.find_element(By.XPATH, './ancestor::article')
+                                    except Exception:
+                                        art = None
+                                    if art:
+                                        try:
+                                            time_el = art.find_element(By.XPATH, ".//time")
+                                            parent = time_el.find_element(By.XPATH, './..')
+                                            href = parent.get_attribute('href')
+                                            if href:
+                                                uid = href.rstrip('/')
+                                        except Exception:
+                                            uid = None
+
+                                    # Fallback to normalized text hash-like key
+                                    if not uid:
+                                        norm = ' '.join(text.split())
+                                        uid = f"text:{norm[:240]}"
+
+                                    all_comments[uid] = text
                             except Exception:
                                 pass
                     except Exception:
@@ -692,16 +984,14 @@ class TwitterCommentScraper:
             except:
                 pass
             
-            # Phase 4: Final targeted collection
-            print(f"   Phase 4: Final targeted collection...")
-            
-            # Scroll back to top and do one more systematic pass
-            self.driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(2)
-            
-            for final_scroll in range(30):
-                position = final_scroll * 500
-                self.driver.execute_script(f"window.scrollTo(0, {position});")
+            # Phase 4: Final targeted collection — one systematic pass without resetting scroll
+            print(f"   Phase 4: Final targeted collection (single pass)...")
+            # perform a finite number of gentle scrolls from current position
+            for final_scroll in range(10):
+                try:
+                    self.driver.execute_script("window.scrollBy(0, 500);")
+                except Exception:
+                    pass
                 time.sleep(0.8)
                 
                 # Final collection with all possible selectors
@@ -720,7 +1010,25 @@ class TwitterCommentScraper:
                                 if (text and len(text) > 5 and text != original_tweet_content and
                                     not any(skip in text.lower() for skip in 
                                            ['replying to', 'show this', 'view', 'more replies'])):
-                                    all_comments.add(text)
+                                    # derive stable uid similar to earlier logic
+                                    uid = None
+                                    try:
+                                        art = elem.find_element(By.XPATH, './ancestor::article')
+                                    except Exception:
+                                        art = None
+                                    if art:
+                                        try:
+                                            time_el = art.find_element(By.XPATH, ".//time")
+                                            parent = time_el.find_element(By.XPATH, './..')
+                                            href = parent.get_attribute('href')
+                                            if href:
+                                                uid = href.rstrip('/')
+                                        except Exception:
+                                            uid = None
+                                    if not uid:
+                                        norm = ' '.join(text.split())
+                                        uid = f"text:{norm[:240]}"
+                                    all_comments[uid] = text
                             except:
                                 pass
                     except:
@@ -756,9 +1064,11 @@ class TwitterCommentScraper:
                     return True
                 return False
 
-            filtered_comments = [c for c in all_comments if not is_ui_text(c)]
+            # Convert dedup map to list and filter UI texts
+            deduped = list(all_comments.values())
+            filtered_comments = [c for c in deduped if not is_ui_text(c)]
 
-            print(f"   ✅ Found {len(filtered_comments)} unique comments total (filtered from {len(all_comments)})")
+            print(f"   ✅ Found {len(filtered_comments)} unique comments total (filtered from {len(deduped)})")
             print(f"   💡 Comment scraping summary: collected {len(filtered_comments)} comments from {tweet_url}")
             
         except Exception as e:
@@ -797,75 +1107,37 @@ class TwitterCommentScraper:
                     # If the post_url is a canonical tweet URL, try to derive the media-specific URL
                     media_url = post_url
                     if post_url and ('/photo/' not in post_url and '/video/' not in post_url):
-                        # prefer photo fallback if present in our earlier heuristics
                         media_url = post_url.rstrip('/') + '/photo/1'
 
-                    # Open media-specific URL in a new tab to ensure the right-side comments panel is available
                     tweet_comments = []
                     try:
-                        if media_url:
-                            if not self.ensure_logged_in(media_url):
-                                print("❌ Skipping post - not authenticated")
-                            else:
-                                opened = False
-                                # Try to navigate to the profile and click the media anchor to open new tab
+                        if not self.ensure_logged_in(media_url):
+                            print("❌ Skipping post - not authenticated")
+                        else:
+                            # Open the tweet/media URL directly in a new tab and scrape comments
+                            try:
+                                self.driver.execute_script("window.open(arguments[0], '_blank');", media_url)
+                            except Exception:
+                                # As a fallback, navigate in the same tab
                                 try:
-                                    if user_url:
-                                        self.driver.get(user_url)
-                                        time.sleep(2)
-                                        # find the article that matches this post_url
-                                        articles = self.driver.find_elements(By.XPATH, "//article[@data-testid='tweet']")
-                                        for a in articles:
-                                            try:
-                                                time_el = a.find_element(By.XPATH, ".//time")
-                                                href = time_el.find_element(By.XPATH, './..').get_attribute('href')
-                                                if href and href.rstrip('/') == post_url.rstrip('/'):
-                                                    # find anchor with photo/video
-                                                    try:
-                                                        media_anchor = a.find_element(By.XPATH, ".//a[contains(@href, '/photo/') or contains(@href, '/video/')]")
-                                                        # click it (may open new tab)
-                                                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", media_anchor)
-                                                        time.sleep(0.4)
-                                                        media_anchor.click()
-                                                        opened = True
-                                                        break
-                                                    except Exception:
-                                                        # fallback: click image element if present
-                                                        try:
-                                                            img_el = a.find_element(By.XPATH, ".//img")
-                                                            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", img_el)
-                                                            time.sleep(0.3)
-                                                            img_el.click()
-                                                            opened = True
-                                                            break
-                                                        except Exception:
-                                                            pass
-                                            except Exception:
-                                                pass
+                                    self.driver.get(media_url)
                                 except Exception:
                                     pass
 
-                                # If clicking didn't open a new tab, fallback to window.open
-                                if not opened:
-                                    self.driver.execute_script("window.open(arguments[0], '_blank');", media_url)
-
+                            time.sleep(2)
+                            tabs = self.driver.window_handles
+                            if len(tabs) > 0:
+                                # switch to the newest tab
+                                self.driver.switch_to.window(tabs[-1])
                                 time.sleep(2)
-                                # switch to new tab (last)
-                                tabs = self.driver.window_handles
-                                if len(tabs) > 0:
-                                    self.driver.switch_to.window(tabs[-1])
-                                    time.sleep(2)
-                                    tweet_comments = self.scrape_comments(media_url)
-                                    # close the tab and return to first tab
-                                    try:
+                                tweet_comments = self.scrape_comments(media_url)
+                                # close the tab and return to first tab if multiple tabs
+                                try:
+                                    if len(tabs) > 1:
                                         self.driver.close()
-                                    except Exception:
-                                        pass
-                                    try:
                                         self.driver.switch_to.window(tabs[0])
-                                    except Exception:
-                                        # if switching back fails, continue
-                                        pass
+                                except Exception:
+                                    pass
                     except Exception as e:
                         print(f"⚠️ Error while scraping comments from media tab: {e}")
                     
@@ -990,14 +1262,18 @@ async def scrape_twitter_media(request: MediaScrapeRequest):
             raise HTTPException(status_code=404, detail='No Twitter profiles found for brand')
 
         profile = user_urls[0]
-        media_urls = scraper.get_media_from_profile(profile, max_posts=request.max_media_posts)
+        media_posts = scraper.get_media_from_profile(profile, max_posts=request.max_media_posts)
 
         results = []
         total_comments = 0
-        for u in media_urls:
-            comments = scraper.scrape_comments(u)
+        for mp in media_posts:
+            post_url = mp.get('post_url') if isinstance(mp, dict) else mp
+            if not post_url:
+                continue
+            comments = scraper.scrape_comments(post_url)
             results.append({
-                'post_url': u,
+                'post_url': post_url,
+                'media_urls': mp.get('media_urls', []) if isinstance(mp, dict) else [],
                 'comments': comments,
                 'comment_count': len(comments)
             })
