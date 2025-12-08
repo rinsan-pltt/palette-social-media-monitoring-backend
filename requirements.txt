@@ -1,0 +1,13 @@
+playwright>=1.35.0
+python-dotenv
+fastapi
+uvicorn[standard]
+pymongo
+openai
+certifi
+motor
+selenium
+webdriver-manager
+ddgs
+bs4
+mashrur_facebook_scraper
