@@ -55,11 +55,11 @@ class TwitterCommentScraper:
             # Provide a desktop user-agent to avoid mobile/reduced views
             ua = os.getenv('TW_USER_AGENT') or 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             options.add_argument(f"--user-agent={ua}")
-            print("⚠️ Running Chrome in headless mode; using desktop user-agent and larger window-size")
+            print("Running Chrome in headless mode; using desktop user-agent and larger window-size")
         else:
             options.add_argument("--start-maximized")
             options.add_argument("--window-size=1920,1080")
-            print("⚠️ Running Chrome with UI (non-headless); set TWITTER_HEADLESS=1 to run headless")
+            print("Running Chrome with UI (non-headless); set TWITTER_HEADLESS=1 to run headless")
        
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -75,7 +75,7 @@ class TwitterCommentScraper:
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         # Load Twitter/X homepage first
-        print("🌐 Loading Twitter/X...")
+        print("Loading Twitter/X...")
         self.driver.get("https://x.com/")
         # give extra time when headless so client-side rendering finishes
         if getattr(self, 'is_headless', False):
@@ -107,17 +107,17 @@ class TwitterCommentScraper:
                         print(f"   ⚠️ Skipping cookie due to domain mismatch: {cookie.get('name')}")
                     except Exception as e:
                         print(f"   Skipping invalid cookie: {e}")
-                print(f"   ✅ Local cookies accepted: {loaded}/{len(file_cookies)}")
+                print(f"Local cookies accepted: {loaded}/{len(file_cookies)}")
                 self.driver.refresh()
                 time.sleep(4)
                 cookies_loaded = True
             except Exception as e:
-                print(f"⚠️ Failed to load local cookie file: {e}")
+                print(f"Failed to load local cookie file: {e}")
 
         if not cookies_loaded:
             cookies_loaded = self.load_cookies_from_mongo()
         if not cookies_loaded:
-            print("\n❌ Cannot proceed without valid authentication cookies.")
+            print("\nCannot proceed without valid authentication cookies.")
             if self.driver:
                 self.driver.quit()
             return False
@@ -210,15 +210,15 @@ class TwitterCommentScraper:
             session_doc = get_session({"type": "twitter_cookies"})
             
             if not session_doc:
-                print("❌ No Twitter cookies found in MongoDB sessions collection")
+                print("No Twitter cookies found in MongoDB sessions collection")
                 return False
                 
             cookies = session_doc.get("cookies", [])
             if not cookies:
-                print("❌ No cookies data found in the session document")
+                print("No cookies data found in the session document")
                 return False
                 
-            print(f"✅ Loading {len(cookies)} cookies from MongoDB")
+            print(f"Loading {len(cookies)} cookies from MongoDB")
             # Ensure we're on x.com so Selenium accepts cookies; Selenium requires the current
             # domain to match the cookie domain. We'll remove cookie 'domain' entries that
             # don't match the current page domain to increase acceptance.
@@ -233,18 +233,18 @@ class TwitterCommentScraper:
                     self.driver.add_cookie(cookie_to_add)
                     loaded += 1
                 except InvalidCookieDomainException:
-                    print(f"   ⚠️ Skipping cookie due to domain mismatch: {cookie.get('name')}")
+                    print(f"Skipping cookie due to domain mismatch: {cookie.get('name')}")
                 except Exception as e:
                     print(f"   Skipping invalid cookie: {e}")
                     pass
-            print(f"   ✅ Cookies accepted: {loaded}/{len(cookies)}")
-            print("✅ Session cookies loaded successfully from MongoDB.")
+            print(f"Cookies accepted: {loaded}/{len(cookies)}")
+            print("Session cookies loaded successfully from MongoDB.")
             self.driver.refresh()
             time.sleep(5)
             return True
             
         except Exception as e:
-            print(f"⚠️ Could not load cookies from MongoDB: {e}")
+            print(f"Could not load cookies from MongoDB: {e}")
             return False
 
     def is_logged_in(self):
@@ -314,7 +314,7 @@ class TwitterCommentScraper:
             return True
 
         # Try reloading cookies from MongoDB (in case driver lost them)
-        print("🔁 Session appears logged out — reloading cookies from DB and refreshing...")
+        print("Session appears logged out — reloading cookies from DB and refreshing...")
         loaded = self.load_cookies_from_mongo()
         if loaded:
             try:
@@ -324,15 +324,15 @@ class TwitterCommentScraper:
                 pass
 
             if self.is_logged_in():
-                print("✅ Session restored from DB cookies")
+                print("Session restored from DB cookies")
                 return True
 
         # If cookie restore didn't work, attempt credential login using env credentials
-        print("🔐 Cookie restore failed — attempting credential login using TW_USER/TW_PASSWORD from environment...")
+        print("Cookie restore failed — attempting credential login using TW_USER/TW_PASSWORD from environment...")
         tw_user = os.getenv('TW_USER')
         tw_pass = os.getenv('TW_PASSWORD')
         if not tw_user or not tw_pass:
-            print("❌ No TW_USER/TW_PASSWORD available in environment to attempt login")
+            print("No TW_USER/TW_PASSWORD available in environment to attempt login")
             return False
 
         try:
@@ -342,16 +342,16 @@ class TwitterCommentScraper:
                 try:
                     cookies = self.driver.get_cookies()
                     upsert_session({"type": "twitter_cookies"}, {"type": "twitter_cookies", "cookies": cookies, "updated_at": int(time.time())})
-                    print(f"💾 Saved {len(cookies)} cookies to sessions collection")
+                    print(f"Saved {len(cookies)} cookies to sessions collection")
                 except Exception as e:
-                    print(f"⚠️ Could not save cookies to MongoDB: {e}")
+                    print(f"Could not save cookies to MongoDB: {e}")
 
                 return True
             else:
-                print("⚠️ Credential login attempt failed or session still logged out")
+                print("Credential login attempt failed or session still logged out")
                 return False
         except Exception as e:
-            print(f"⚠️ Exception during credential login attempt: {e}")
+            print(f"Exception during credential login attempt: {e}")
             return False
 
     def login_with_credentials(self, username: str, password: str) -> bool:
@@ -420,7 +420,7 @@ class TwitterCommentScraper:
                     pw_elem = None
 
             if not pw_elem:
-                print('⚠️ Password field not found automatically during login')
+                print('Password field not found automatically during login')
                 return False
 
             try:
@@ -454,7 +454,7 @@ class TwitterCommentScraper:
     
     def search_twitter_users(self, brand_name, max_results=5):
         """Search for Twitter users/profiles using DuckDuckGo"""
-        print(f"🔎 Searching Twitter for users related to '{brand_name}'...")
+        print(f"Searching Twitter for users related to '{brand_name}'...")
         user_urls = []
         # Use DuckDuckGo search results but be tolerant of different result shapes
         with DDGS() as ddgs:
@@ -497,11 +497,11 @@ class TwitterCommentScraper:
                     if profile_url not in user_urls and len(user_urls) < max_results:
                         user_urls.append(profile_url)
             except Exception as e:
-                print(f"⚠️ Search error: {e}")
+                print(f"Search error: {e}")
 
         # If search didn't find anything, try direct profile checks using the browser
         if not user_urls:
-            print("🔁 DDGS returned no profiles — trying direct profile URL checks in browser...")
+            print("DDGS returned no profiles — trying direct profile URL checks in browser...")
             # Candidate username forms to try
             candidates = set()
             base = brand_name.strip()
@@ -551,17 +551,17 @@ class TwitterCommentScraper:
                 except Exception as e:
                     print(f"   Error checking {profile_url}: {e}")
 
-        print(f"✅ Found {len(user_urls)} Twitter profiles:")
+        print(f"Found {len(user_urls)} Twitter profiles:")
         for u in user_urls:
             print(f"   • {u}")
         return user_urls
     
     def get_tweets_from_profile(self, profile_url, max_tweets=10):
         """Extract recent tweets from a user profile"""
-        print(f"\n📌 Scraping tweets from: {profile_url}")
+        print(f"\nScraping tweets from: {profile_url}")
         # Ensure we are logged in (reload cookies if necessary)
         if not self.ensure_logged_in(profile_url):
-            print("❌ Cannot scrape tweets because session is not authenticated")
+            print("Cannot scrape tweets because session is not authenticated")
             return []
         tweets = []
         
@@ -601,19 +601,19 @@ class TwitterCommentScraper:
                 except Exception as e:
                     continue
             
-            print(f"   ✅ Extracted {len(tweets)} tweets")
+            print(f"Extracted {len(tweets)} tweets")
             
         except Exception as e:
-            print(f"   ⚠️ Error scraping profile: {e}")
+            print(f"Error scraping profile: {e}")
         
         return tweets
 
     def get_media_from_profile(self, profile_url, max_posts=20):
         """Navigate to the user's Media tab and collect image/video post URLs (media posts)."""
-        print(f"\n📷 Scraping media posts from: {profile_url}")
+        print(f"\nScraping media posts from: {profile_url}")
         # Ensure we are logged in (reload cookies if necessary)
         if not self.ensure_logged_in(profile_url):
-            print("❌ Cannot scrape media because session is not authenticated")
+            print("Cannot scrape media because session is not authenticated")
             return []
         media_urls = []
         try:
@@ -701,9 +701,9 @@ class TwitterCommentScraper:
                     attempts = 0
                 last_count = len(media_urls)
 
-            print(f"   ✅ Found {len(media_urls)} media posts")
+            print(f"Found {len(media_urls)} media posts")
         except Exception as e:
-            print(f"   ⚠️ Error scraping media tab: {e}")
+            print(f"Error scraping media tab: {e}")
 
         # Now visit each post and extract direct media URLs (images / videos)
         media_posts = []
@@ -751,10 +751,10 @@ class TwitterCommentScraper:
     
     def scrape_comments(self, tweet_url, max_comments=999999):
         """Scrape ALL comments from a specific tweet including nested replies"""
-        print(f"💬 Scraping ALL comments from: {tweet_url}")
+        print(f"Scraping ALL comments from: {tweet_url}")
         # Ensure we're logged in before scraping comments
         if not self.ensure_logged_in(tweet_url):
-            print("❌ Cannot scrape comments because session is not authenticated")
+            print("Cannot scrape comments because session is not authenticated")
             return []
         # Use a map of unique_id -> text to deduplicate reliably across DOM changes
         all_comments = {}
@@ -1068,11 +1068,11 @@ class TwitterCommentScraper:
             deduped = list(all_comments.values())
             filtered_comments = [c for c in deduped if not is_ui_text(c)]
 
-            print(f"   ✅ Found {len(filtered_comments)} unique comments total (filtered from {len(deduped)})")
-            print(f"   💡 Comment scraping summary: collected {len(filtered_comments)} comments from {tweet_url}")
+            print(f"Found {len(filtered_comments)} unique comments total (filtered from {len(deduped)})")
+            print(f"Comment scraping summary: collected {len(filtered_comments)} comments from {tweet_url}")
             
         except Exception as e:
-            print(f"   ⚠️ Error scraping comments: {e}")
+            print(f"Error scraping comments: {e}")
         
         return list(filtered_comments)
     
@@ -1089,7 +1089,7 @@ class TwitterCommentScraper:
             user_urls = self.search_twitter_users(brand_name, max_results=max_users)
             
             if not user_urls:
-                print("❌ No Twitter profiles found")
+                print("No Twitter profiles found")
                 return []
             
             all_results = []
@@ -1112,7 +1112,7 @@ class TwitterCommentScraper:
                     tweet_comments = []
                     try:
                         if not self.ensure_logged_in(media_url):
-                            print("❌ Skipping post - not authenticated")
+                            print("Skipping post - not authenticated")
                         else:
                             # Open the tweet/media URL directly in a new tab and scrape comments
                             try:
@@ -1139,7 +1139,7 @@ class TwitterCommentScraper:
                                 except Exception:
                                     pass
                     except Exception as e:
-                        print(f"⚠️ Error while scraping comments from media tab: {e}")
+                        print(f"Error while scraping comments from media tab: {e}")
                     
                     result = {
                         "user_profile": user_url,
@@ -1156,7 +1156,7 @@ class TwitterCommentScraper:
             return all_results
             
         except Exception as e:
-            print(f"⚠️ Error in scraping workflow: {e}")
+            print(f"Error in scraping workflow: {e}")
             return []
         
         finally:
@@ -1171,7 +1171,7 @@ class TwitterCommentScraper:
             return res.get("inserted_id") or str(res)
             
         except Exception as e:
-            print(f"⚠️ Error saving to MongoDB: {e}")
+            print(f"Error saving to MongoDB: {e}")
             raise
 
 
@@ -1208,8 +1208,8 @@ async def scrape_twitter_comments(request: TwitterScrapeRequest):
                 backup_path = os.path.join(backup_dir, f'twitter_backup_{request.brand_name}_{ts}.json')
                 with open(backup_path, 'w', encoding='utf-8') as bf:
                     json.dump({'brand_name': request.brand_name, 'scraped_at': ts, 'results': results}, bf, ensure_ascii=False, indent=2)
-                print(f"⚠️ Error saving to MongoDB: {e}")
-                print(f"💾 Saved local backup to {backup_path}")
+                print(f"Error saving to MongoDB: {e}")
+                print(f"Saved local backup to {backup_path}")
                 save_message = f"Saved results to local backup: {backup_path} (MongoDB write failed: {e})"
             except Exception as bf_err:
                 # If backup also fails, raise

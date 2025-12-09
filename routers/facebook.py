@@ -85,46 +85,83 @@ def scroll_page(driver, max_scrolls=50):
 
 
 def load_cookies_if_available(driver, cookie_file):
+    """Try to load cookies from MongoDB sessions collection first, then fallback to a local
+    cookie file. Returns a tuple (authenticated: bool, source: str) where source is one of
+    'mongo', 'local', or 'none'."""
+    source = 'none'
+    cookies = None
+
     # First try to load cookies from MongoDB sessions collection (platform='facebook')
     try:
+        logger.info("Attempting to load Facebook cookies from MongoDB sessions collection")
+        # Try a few common session document shapes
         doc = get_session({"platform": "facebook"})
-        if doc and isinstance(doc.get("cookies"), list) and doc.get("cookies"):
-            cookies = doc.get("cookies")
-        else:
+        if not doc:
+            doc = get_session({"type": "facebook_cookies"})
+        if not doc:
+            doc = get_session({"type": "facebook"})
+
+        if doc is None:
+            logger.info("No Facebook session document found in MongoDB sessions collection")
             cookies = None
-    except Exception:
+        else:
+            logger.debug("Found session document in MongoDB: %s", {k: v for k, v in doc.items() if k != 'cookies'})
+            cands = doc.get("cookies") or doc.get("cookie") or doc.get("session")
+            if isinstance(cands, list) and cands:
+                cookies = cands
+                source = 'mongo'
+                logger.info("Loaded %d cookies from MongoDB session document", len(cookies))
+            else:
+                logger.info("Session document present but no cookie list found")
+                cookies = None
+    except Exception as e:
+        logger.debug("Error while reading session document from MongoDB: %s", e)
         cookies = None
 
     # If no cookies found in DB, fall back to local cookie file
     if not cookies:
         if not os.path.exists(cookie_file):
-            return False
+            return False, source
         try:
             with open(cookie_file, 'r', encoding='utf-8') as f:
                 cookies = json.load(f)
-        except Exception:
+            source = 'local'
+            logger.info("Loaded %d cookies from local cookie file: %s", len(cookies) if isinstance(cookies, list) else 0, cookie_file)
+        except Exception as e:
+            logger.debug("Failed to read local cookie file %s: %s", cookie_file, e)
             cookies = None
 
     if not cookies:
-        return False
+        return False, source
 
     try:
         driver.get('https://www.facebook.com/')
+        added = 0
         for cookie in cookies:
-            allowed = {k: v for k, v in cookie.items() if k in ('name', 'value', 'domain', 'path', 'expiry', 'httpOnly', 'secure')}
+            # accept both httpOnly and httponly naming
+            c = cookie.copy()
+            if 'httponly' in c and 'httpOnly' not in c:
+                c['httpOnly'] = c.pop('httponly')
+            allowed = {k: v for k, v in c.items() if k in ('name', 'value', 'domain', 'path', 'expiry', 'httpOnly', 'secure')}
             try:
                 driver.add_cookie(allowed)
-            except Exception:
+                added += 1
+            except Exception as e:
+                logger.debug("Skipping cookie %s due to add_cookie error: %s", cookie.get('name'), e)
                 continue
+        logger.info("Attempted to inject cookies, successfully added %d/%d (source=%s)", added, len(cookies), source)
         driver.refresh()
         random_wait(3, 5)
         try:
             driver.find_element(By.NAME, 'email')
-            return False
+            # found the login email input: still logged out
+            return False, source
         except NoSuchElementException:
-            return True
-    except Exception:
-        return False
+            # email input not found: likely logged in
+            return True, source
+    except Exception as e:
+        logger.debug("Exception during cookie injection: %s", e)
+        return False, source
 
 
 def perform_login_and_save_cookies(driver, cookie_file, email=None, pwd=None):
@@ -189,6 +226,74 @@ def perform_login_and_save_cookies(driver, cookie_file, email=None, pwd=None):
     except Exception as e:
         print(f'Login error: {e}')
         return False
+
+
+def manual_capture_and_save_cookies(cookie_file, timeout=300):
+    """Open a visible Chrome window and let the user manually log in (handles 2FA). Polls
+    until the login appears successful or `timeout` seconds elapse. On success saves cookies
+    to both `cookie_file` and MongoDB sessions collection.
+    Returns True if cookies were captured and saved, False otherwise."""
+    from selenium.webdriver.chrome.options import Options
+
+    logger.info("Opening visible Chrome for manual Facebook login (you may need to complete 2FA/challenge)...")
+    chrome_options = Options()
+    # Visible browser (no headless)
+    chrome_options.add_argument('--start-maximized')
+    chrome_options.add_argument('--window-size=1200,900')
+    chrome_options.add_argument('--lang=en-US')
+    chrome_options.add_argument('--disable-extensions')
+    chrome_options.add_argument('--disable-infobars')
+
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    try:
+        try:
+            driver.get('https://www.facebook.com/login')
+        except Exception:
+            try:
+                driver.get('https://www.facebook.com')
+            except Exception:
+                pass
+
+        start = time.time()
+        while time.time() - start < timeout:
+            time.sleep(4)
+            try:
+                # If email input is not present, assume logged in (best-effort)
+                els = driver.find_elements(By.NAME, 'email')
+                if not els:
+                    # success — capture cookies
+                    try:
+                        cookies = driver.get_cookies()
+                        # write local file
+                        try:
+                            with open(cookie_file, 'w', encoding='utf-8') as f:
+                                json.dump(cookies, f)
+                        except Exception as e:
+                            logger.debug("Failed to write local cookie file: %s", e)
+                        # upsert into Mongo
+                        try:
+                            upsert_session({"platform": "facebook"}, {"platform": "facebook", "cookies": cookies, "updated_at": int(time.time())})
+                        except Exception as e:
+                            logger.exception("Failed to upsert cookies to MongoDB during manual capture: %s", e)
+                        logger.info("Manual login detected and cookies saved (count=%d)", len(cookies))
+                        return True
+                    except Exception as e:
+                        logger.exception("Error capturing cookies after manual login: %s", e)
+                        return False
+                else:
+                    # still showing email input — continue waiting
+                    logger.info("Waiting for manual login to complete... (%ds remaining)", int(timeout - (time.time() - start)))
+            except Exception as e:
+                logger.debug("Polling error while waiting for manual login: %s", e)
+                time.sleep(2)
+
+        logger.info("Manual login timed out after %d seconds", timeout)
+        return False
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 # Copied and adapted from b.py
@@ -581,8 +686,8 @@ def facebook_scrape(req: ScrapeRequest):
         # Always attempt to load cookies from Mongo (load_cookies_if_available does that)
         logger.info("Starting Facebook scrape for profile: %s (max_posts=%s)", profile, max_posts)
 
-        logged = load_cookies_if_available(driver, COOKIE_FILE)
-        logger.info("Loaded cookies from sessions/local: %s", bool(logged))
+        logged, cookie_source = load_cookies_if_available(driver, COOKIE_FILE)
+        logger.info("Cookie load result: authenticated=%s, source=%s", bool(logged), cookie_source)
         if not logged:
             # No valid cookies; attempt automated login using env credentials
             fb_email = os.getenv('FB_EMAIL')
@@ -593,11 +698,30 @@ def facebook_scrape(req: ScrapeRequest):
             except Exception:
                 login_ok = False
             logger.info("Login attempt result: %s", bool(login_ok))
-
             if not login_ok:
-                logger.error("Facebook login failed; no valid cookies available and automated login failed")
-                # As a last resort, return an error instructing user to provide valid session cookies
-                raise HTTPException(status_code=401, detail='Facebook login failed; provide valid session cookies in MongoDB sessions collection or valid FB_EMAIL/FB_PASSWORD in environment')
+                logger.warning("Automated credential login failed. Attempting manual interactive capture as fallback.")
+                try:
+                    manual_ok = manual_capture_and_save_cookies(COOKIE_FILE, timeout=300)
+                except Exception as e:
+                    logger.exception("Manual capture raised exception: %s", e)
+                    manual_ok = False
+
+                if manual_ok:
+                    # after manual capture saved cookies to Mongo/local, try loading them into current driver
+                    logger.info("Manual capture succeeded; reloading cookies into headless driver")
+                    try:
+                        logged_after, src_after = load_cookies_if_available(driver, COOKIE_FILE)
+                        logger.info("Post-manual capture cookie load result: authenticated=%s, source=%s", bool(logged_after), src_after)
+                        if logged_after:
+                            logged = True
+                        else:
+                            logger.error("Manual capture completed but session still not authenticated after injection")
+                    except Exception as e:
+                        logger.exception("Failed to reload cookies after manual capture: %s", e)
+
+                if not logged:
+                    logger.error("Facebook login failed; no valid cookies available and automated login failed")
+                    raise HTTPException(status_code=401, detail='Facebook login failed; provide valid session cookies in MongoDB sessions collection or perform manual login to capture cookies')
 
         # Step 1: collect photos page links first
         if max_posts and max_posts > 0:

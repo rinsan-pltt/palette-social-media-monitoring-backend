@@ -701,7 +701,7 @@ async def scrape_instagram(request: ScrapeRequest):
                 seen.add(normalized)
                 hrefs.append(normalized)
 
-            print(f"🔎 Found {len(hrefs)} unique post URLs (raw anchors: {len(posts)}).")
+            print(f"Found {len(hrefs)} unique post URLs (raw anchors: {len(posts)}).")
             if not hrefs:
                 await browser.close()
                 return ScrapeResponse(

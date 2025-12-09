@@ -168,12 +168,12 @@ def search_videos(brand, scroll_count=5):
             input_box.fill(brand)
             page.wait_for_timeout(300)
         except Exception as e:
-            raise Exception(f"⚠️ Could not type into search box: {e}")
+            raise Exception(f"Could not type into search box: {e}")
 
         try:
             page.click("button.ytSearchboxComponentSearchButton", timeout=10000)
         except Exception as e:
-            raise Exception(f"❌ Could not click search button: {e}")
+            raise Exception(f"Could not click search button: {e}")
 
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(3000)
@@ -181,7 +181,7 @@ def search_videos(brand, scroll_count=5):
         try:
             page.wait_for_selector("ytd-video-renderer", timeout=15000)
         except:
-            print("❌ No video results found on page.")
+            print("No video results found on page.")
             browser.close()
             return []
 
@@ -213,7 +213,7 @@ def scrape_comments(url):
     try:
         comments = scraper.scrape_comments(url)
     except Exception as e:
-        print(f"⚠️ Error scraping comments for {url}: {e}")
+        print(f"Error scraping comments for {url}: {e}")
         comments = []
     return comments
 
